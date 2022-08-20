@@ -498,7 +498,26 @@ pub mod pallet {
 			Self::deposit_event(Event::NFTBurned { owner: sender, nft_id });
 			Ok(())
 		}
+		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
+		#[transactional]
+		pub fn burn_nft_by_issuer(
+			origin: OriginFor<T>,
+			collection_id: CollectionId,
+			nft_id: NftId,
+		) -> DispatchResult {
+			let sender = ensure_signed(origin.clone())?;
+			let collection =
+			Self::collections(collection_id).ok_or(Error::<T>::CollectionUnknown)?;
+			// Check ownership
+			ensure!(sender == collection.issuer, Error::<T>::NoPermission);
+			let max_recursions = T::MaxRecursions::get();
+			let (_collection_id, nft_id) = Self::nft_burn(collection_id, nft_id, max_recursions)?;
 
+			pallet_uniques::Pallet::<T>::do_burn(collection_id, nft_id, |_, _| Ok(()))?;
+
+			Self::deposit_event(Event::NFTBurned { owner: sender, nft_id });
+			Ok(())
+		}
 		/// destroy collection
 		#[pallet::weight(10_000 + T::DbWeight::get().reads_writes(1,1))]
 		#[transactional]

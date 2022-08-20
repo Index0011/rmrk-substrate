@@ -64,8 +64,8 @@ where
 				!Pallet::<T>::is_locked(collection_id, *nft_id),
 				pallet_uniques::Error::<T>::Locked
 			);
-			let (root_owner, _) = Pallet::<T>::lookup_root_owner(collection_id, *nft_id)?;
-			ensure!(root_owner == collection.issuer, Error::<T>::NoPermission);
+			//let (root_owner, _) = Pallet::<T>::lookup_root_owner(collection_id, *nft_id)?;
+			//ensure!(root_owner == collection.issuer, Error::<T>::NoPermission);
 		}
 		Properties::<T>::insert((&collection_id, maybe_nft_id, &key), &value);
 		Ok(())
