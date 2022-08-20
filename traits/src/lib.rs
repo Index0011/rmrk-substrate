@@ -8,9 +8,11 @@ pub mod base;
 pub mod collection;
 pub mod nft;
 pub mod part;
+pub mod phantom_type;
 pub mod priority;
 pub mod property;
 pub mod resource;
+mod serialize;
 pub mod theme;
 
 pub use base::{Base, BaseInfo};
@@ -18,11 +20,12 @@ pub use part::{EquippableList, FixedPart, PartType, SlotPart};
 pub use theme::{Theme, ThemeProperty};
 // pub use part::{PartInfo};
 pub use collection::{Collection, CollectionInfo};
-pub use nft::{AccountIdOrCollectionNftTuple, Nft, NftInfo, RoyaltyInfo};
+pub use nft::{AccountIdOrCollectionNftTuple, Nft, NftChild, NftInfo, RoyaltyInfo};
 pub use priority::Priority;
-pub use property::Property;
+pub use property::{Property, PropertyInfo};
 pub use resource::{
-	BasicResource, ComposableResource, Resource, ResourceInfo, ResourceTypes, SlotResource,
+	BasicResource, ComposableResource, Resource, ResourceInfo, ResourceInfoMin, ResourceTypes,
+	SlotResource,
 };
 pub mod primitives {
 	pub type CollectionId = u32;
@@ -33,3 +36,4 @@ pub mod primitives {
 	pub type PartId = u32;
 	pub type ZIndex = u32;
 }
+pub use phantom_type::PhantomType;

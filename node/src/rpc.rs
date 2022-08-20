@@ -8,12 +8,22 @@
 use std::sync::Arc;
 
 use jsonrpsee::RpcModule;
-use rmrk_substrate_runtime::{opaque::Block, AccountId, Balance, Index};
+
+use rmrk_substrate_runtime::{
+	opaque::Block, AccountId, Balance, CollectionSymbolLimit, Index, KeyLimit,
+	MaxCollectionsEquippablePerPart, MaxPropertiesPerTheme, PartsLimit, UniquesStringLimit,
+	ValueLimit,
+};
+use rmrk_traits::{
+	primitives::{CollectionId, PartId},
+	BaseInfo, CollectionInfo, NftInfo, PartType, PropertyInfo, ResourceInfo, Theme, ThemeProperty,
+};
 pub use sc_rpc_api::DenyUnsafe;
 use sc_transaction_pool_api::TransactionPool;
 use sp_api::ProvideRuntimeApi;
 use sp_block_builder::BlockBuilder;
 use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
+use sp_runtime::{BoundedVec, Permill};
 
 /// Full client dependencies.
 pub struct FullDeps<C, P> {
@@ -36,21 +46,39 @@ where
 	C::Api: substrate_frame_rpc_system::AccountNonceApi<Block, AccountId, Index>,
 	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
 	C::Api: BlockBuilder<Block>,
+	C::Api: pallet_rmrk_rpc_runtime_api::RmrkApi<
+		Block,
+		AccountId,
+		CollectionInfo<
+			BoundedVec<u8, UniquesStringLimit>,
+			BoundedVec<u8, CollectionSymbolLimit>,
+			AccountId,
+		>,
+		NftInfo<AccountId, Permill, BoundedVec<u8, UniquesStringLimit>>,
+		ResourceInfo<BoundedVec<u8, UniquesStringLimit>, BoundedVec<PartId, PartsLimit>>,
+		PropertyInfo<BoundedVec<u8, KeyLimit>, BoundedVec<u8, ValueLimit>>,
+		BaseInfo<AccountId, BoundedVec<u8, UniquesStringLimit>>,
+		PartType<
+			BoundedVec<u8, UniquesStringLimit>,
+			BoundedVec<CollectionId, MaxCollectionsEquippablePerPart>,
+		>,
+		Theme<
+			BoundedVec<u8, UniquesStringLimit>,
+			BoundedVec<ThemeProperty<BoundedVec<u8, UniquesStringLimit>>, MaxPropertiesPerTheme>,
+		>,
+	>,
 	P: TransactionPool + 'static,
 {
-	use pallet_transaction_payment_rpc::{TransactionPaymentApiServer, TransactionPayment};
-	use substrate_frame_rpc_system::{SystemApiServer, System};
+	use pallet_rmrk_rpc::{Rmrk, RmrkApiServer};
+	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApiServer};
+	use substrate_frame_rpc_system::{System, SystemApiServer};
 
 	let mut module = RpcModule::new(());
 	let FullDeps { client, pool, deny_unsafe } = deps;
 
 	module.merge(System::new(client.clone(), pool.clone(), deny_unsafe).into_rpc())?;
-	module.merge(TransactionPayment::new(client).into_rpc())?;
-
-	// Extend this RPC with a custom API by using the following syntax.
-	// `YourRpcStruct` should have a reference to a client, which is needed
-	// to call into the runtime.
-	// `module.merge(YourRpcTrait::into_rpc(YourRpcStruct::new(ReferenceToClient, ...)))?;`
+	module.merge(TransactionPayment::new(client.clone()).into_rpc())?;
+	module.merge(Rmrk::new(client.clone()).into_rpc())?;
 
 	Ok(module)
 }

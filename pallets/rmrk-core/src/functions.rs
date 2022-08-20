@@ -6,11 +6,14 @@
 
 use super::*;
 use codec::{Codec, Decode, Encode};
-use frame_support::traits::tokens::Locker;
+use frame_support::traits::{tokens::Locker, Get};
+
 use sp_runtime::{
 	traits::{Saturating, TrailingZeroInput},
 	ArithmeticError,
 };
+
+use sp_std::collections::btree_set::BTreeSet;
 
 // Randomness to generate NFT virtual accounts
 pub const SALT_RMRK_NFT: &[u8; 8] = b"RmrkNft/";
@@ -65,6 +68,33 @@ where
 		Properties::<T>::insert((&collection_id, maybe_nft_id, &key), &value);
 		Ok(())
 	}
+
+	// Internal function to set a property for downstream `Origin::root()` calls.
+	fn do_set_property(
+		collection_id: CollectionId,
+		maybe_nft_id: Option<NftId>,
+		key: KeyLimitOf<T>,
+		value: ValueLimitOf<T>,
+	) -> sp_runtime::DispatchResult {
+		// Ensure collection exists
+		Collections::<T>::get(&collection_id).ok_or(Error::<T>::CollectionUnknown)?;
+		Properties::<T>::insert((&collection_id, maybe_nft_id, &key), &value);
+
+		Self::deposit_event(Event::PropertySet { collection_id, maybe_nft_id, key, value });
+		Ok(())
+	}
+
+	// Internal function to remove a property for downstream `Origin::root()` calls.
+	fn do_remove_property(
+		collection_id: CollectionId,
+		maybe_nft_id: Option<NftId>,
+		key: KeyLimitOf<T>,
+	) -> sp_runtime::DispatchResult {
+		Properties::<T>::remove((&collection_id, maybe_nft_id, &key));
+
+		Self::deposit_event(Event::PropertyRemoved { collection_id, maybe_nft_id, key });
+		Ok(())
+	}
 }
 
 impl<T: Config>
@@ -78,9 +108,15 @@ where
 		collection_id: CollectionId,
 		nft_id: NftId,
 		resource: ResourceTypes<BoundedVec<u8, T::StringLimit>, BoundedVec<PartId, T::PartsLimit>>,
+		adding_on_mint: bool,
+		resource_id: ResourceId,
 	) -> Result<ResourceId, DispatchError> {
+		ensure!(
+			Resources::<T>::get((collection_id, nft_id, resource_id)).is_none(),
+			Error::<T>::ResourceAlreadyExists
+		);
+
 		let collection = Self::collections(collection_id).ok_or(Error::<T>::CollectionUnknown)?;
-		let resource_id = Self::get_next_resource_id(collection_id, nft_id)?;
 
 		ensure!(collection.issuer == sender, Error::<T>::NoPermission);
 		let (root_owner, _) = Pallet::<T>::lookup_root_owner(collection_id, nft_id)?;
@@ -91,6 +127,12 @@ where
 			ResourceTypes::Basic(_r) => (),
 			ResourceTypes::Composable(r) => {
 				EquippableBases::<T>::insert((collection_id, nft_id, r.base), ());
+				if let Some((base, slot)) = r.slot {
+					EquippableSlots::<T>::insert(
+						(collection_id, nft_id, resource_id, base, slot),
+						(),
+					);
+				}
 			},
 			ResourceTypes::Slot(r) => {
 				EquippableSlots::<T>::insert(
@@ -100,10 +142,19 @@ where
 			},
 		}
 
+		// Resource should be in a pending state if the rootowner of the resource is not the sender
+		// of the transaction, unless the resource is being added on mint.  This prevents the
+		// situation where an NFT being minted *directly to* a non-owned NFT *with resources* will
+		// have those resources be *pending*.  While the minted NFT itself will be pending, it is
+		// inefficent and unnecessary to have the resources also be pending.  Otherwise, in such a
+		// case, the owner would have to accept not only the NFT but also all originally-added
+		// resources.
+		let pending = (root_owner != sender) && !adding_on_mint;
+
 		let res: ResourceInfo<BoundedVec<u8, T::StringLimit>, BoundedVec<PartId, T::PartsLimit>> =
 			ResourceInfo::<BoundedVec<u8, T::StringLimit>, BoundedVec<PartId, T::PartsLimit>> {
 				id: resource_id,
-				pending: root_owner != sender,
+				pending,
 				pending_removal: false,
 				resource,
 			};
@@ -142,8 +193,8 @@ where
 		nft_id: NftId,
 		resource_id: ResourceId,
 	) -> DispatchResult {
-		let (root_owner, _) = Pallet::<T>::lookup_root_owner(collection_id, nft_id)?;
 		let collection = Self::collections(collection_id).ok_or(Error::<T>::CollectionUnknown)?;
+		let (root_owner, _) = Pallet::<T>::lookup_root_owner(collection_id, nft_id)?;
 		ensure!(collection.issuer == sender, Error::<T>::NoPermission);
 		ensure!(
 			Resources::<T>::contains_key((collection_id, nft_id, resource_id)),
@@ -209,7 +260,8 @@ where
 		max: Option<u32>,
 		symbol: BoundedCollectionSymbolOf<T>,
 	) -> Result<CollectionId, DispatchError> {
-		let collection = CollectionInfo { issuer, metadata, max, symbol, nfts_count: 0 };
+		let collection =
+			CollectionInfo { issuer: issuer.clone(), metadata, max, symbol, nfts_count: 0 };
 		let collection_id =
 			<CollectionIndex<T>>::try_mutate(|n| -> Result<CollectionId, DispatchError> {
 				let id = *n;
@@ -217,7 +269,21 @@ where
 				*n += 1;
 				Ok(id)
 			})?;
+		// Call the pallet_uniques function to create collection
+		pallet_uniques::Pallet::<T>::do_create_collection(
+			collection_id,
+			issuer.clone(),
+			issuer.clone(),
+			T::CollectionDeposit::get(),
+			false,
+			pallet_uniques::Event::Created {
+				collection: collection_id,
+				creator: issuer.clone(),
+				owner: issuer.clone(),
+			},
+		)?;
 		Collections::<T>::insert(collection_id, collection);
+		Self::deposit_event(Event::CollectionCreated { issuer, collection_id });
 		Ok(collection_id)
 	}
 
@@ -258,51 +324,54 @@ where
 	}
 }
 
-impl<T: Config> Nft<T::AccountId, StringLimitOf<T>> for Pallet<T>
+impl<T: Config> Nft<T::AccountId, StringLimitOf<T>, BoundedResourceInfoTypeOf<T>> for Pallet<T>
 where
 	T: pallet_uniques::Config<CollectionId = CollectionId, ItemId = NftId>,
 {
 	type MaxRecursions = T::MaxRecursions;
 
 	fn nft_mint(
-		_sender: T::AccountId,
+		sender: T::AccountId,
 		owner: T::AccountId,
+		nft_id: NftId,
 		collection_id: CollectionId,
 		royalty_recipient: Option<T::AccountId>,
 		royalty_amount: Option<Permill>,
 		metadata: StringLimitOf<T>,
 		transferable: bool,
+		resources: Option<BoundedResourceInfoTypeOf<T>>,
 	) -> sp_std::result::Result<(CollectionId, NftId), DispatchError> {
-		let nft_id = Self::get_next_nft_id(collection_id)?;
+		ensure!(!Self::nft_exists((collection_id, nft_id)), Error::<T>::NftAlreadyExists);
 		let collection = Self::collections(collection_id).ok_or(Error::<T>::CollectionUnknown)?;
 
-		// Prevent minting when next NFT id is greater than the collection max.
+		// Prevent minting when nfts_count is greater than the collection max.
 		if let Some(max) = collection.max {
-			ensure!(nft_id < max, Error::<T>::CollectionFullOrLocked);
+			ensure!(collection.nfts_count < max, Error::<T>::CollectionFullOrLocked);
 		}
 
-		let mut royalty: Option<RoyaltyInfo<T::AccountId>> = None;
+		// NFT should be pending if minting to another account
+		let pending = owner != sender;
+
+		let mut royalty = None;
 
 		if let Some(amount) = royalty_amount {
 			match royalty_recipient {
 				Some(recipient) => {
-					royalty = Some(RoyaltyInfo::<T::AccountId> { recipient, amount });
+					royalty = Some(RoyaltyInfo { recipient, amount });
 				},
 				None => {
-					royalty =
-						Some(RoyaltyInfo::<T::AccountId> { recipient: owner.clone(), amount });
+					// If a royalty amount is passed but no recipient, defaults to the sender
+					royalty = Some(RoyaltyInfo { recipient: owner.clone(), amount });
 				},
 			}
 		};
 
-		let owner_as_maybe_account = AccountIdOrCollectionNftTuple::AccountId(owner.clone());
-
 		let nft = NftInfo {
-			owner: owner_as_maybe_account,
+			owner: AccountIdOrCollectionNftTuple::AccountId(owner.clone()),
 			royalty,
 			metadata,
 			equipped: false,
-			pending: false,
+			pending,
 			transferable,
 		};
 
@@ -315,6 +384,118 @@ where
 			collection.nfts_count = nfts_count;
 			Ok(())
 		})?;
+
+		// Call do_mint for pallet_uniques
+		pallet_uniques::Pallet::<T>::do_mint(collection_id, nft_id, owner.clone(), |_details| {
+			Ok(())
+		})?;
+
+		// Add all at-mint resources
+		if let Some(resources) = resources {
+			for res in resources {
+				Self::resource_add(
+					sender.clone(),
+					collection_id,
+					nft_id,
+					res.resource,
+					true,
+					res.id,
+				)?;
+			}
+		}
+
+		Self::deposit_event(Event::NftMinted {
+			owner: AccountIdOrCollectionNftTuple::AccountId(owner),
+			collection_id,
+			nft_id,
+		});
+
+		Ok((collection_id, nft_id))
+	}
+
+	fn nft_mint_directly_to_nft(
+		sender: T::AccountId,
+		owner: (CollectionId, NftId),
+		nft_id: NftId,
+		collection_id: CollectionId,
+		royalty_recipient: Option<T::AccountId>,
+		royalty_amount: Option<Permill>,
+		metadata: StringLimitOf<T>,
+		transferable: bool,
+		resources: Option<BoundedResourceInfoTypeOf<T>>,
+	) -> sp_std::result::Result<(CollectionId, NftId), DispatchError> {
+		ensure!(!Self::nft_exists((collection_id, nft_id)), Error::<T>::NftAlreadyExists);
+		let collection = Self::collections(collection_id).ok_or(Error::<T>::CollectionUnknown)?;
+
+		// Prevent minting when nfts_count is greater than the collection max.
+		if let Some(max) = collection.max {
+			ensure!(collection.nfts_count < max, Error::<T>::CollectionFullOrLocked);
+		}
+
+		// Calculate the rootowner of the intended owner of the minted NFT
+		let (rootowner, _) = Self::lookup_root_owner(owner.0, owner.1)?;
+
+		// NFT should be pending if minting either to an NFT owned by another account
+		let pending = rootowner != sender;
+
+		let mut royalty = None;
+
+		if let Some(amount) = royalty_amount {
+			match royalty_recipient {
+				Some(recipient) => {
+					royalty = Some(RoyaltyInfo { recipient, amount });
+				},
+				None => {
+					royalty = Some(RoyaltyInfo { recipient: rootowner, amount });
+				},
+			}
+		};
+
+		let nft = NftInfo {
+			owner: AccountIdOrCollectionNftTuple::CollectionAndNftTuple(owner.0, owner.1),
+			royalty,
+			metadata,
+			equipped: false,
+			pending,
+			transferable,
+		};
+
+		Nfts::<T>::insert(collection_id, nft_id, nft);
+
+		// increment nfts counter
+		let nfts_count = collection.nfts_count.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+		Collections::<T>::try_mutate(collection_id, |collection| -> DispatchResult {
+			let collection = collection.as_mut().ok_or(Error::<T>::CollectionUnknown)?;
+			collection.nfts_count = nfts_count;
+			Ok(())
+		})?;
+
+		// For Uniques, we need to decode the "virtual account" ID to be the owner
+		let uniques_owner = Self::nft_to_account_id(owner.0, owner.1);
+
+		pallet_uniques::Pallet::<T>::do_mint(collection_id, nft_id, uniques_owner, |_details| {
+			Ok(())
+		})?;
+
+		// Add all at-mint resources
+		if let Some(resources) = resources {
+			for res in resources {
+				Self::resource_add(
+					sender.clone(),
+					collection_id,
+					nft_id,
+					res.resource,
+					true,
+					res.id,
+				)?;
+			}
+		}
+
+		Self::deposit_event(Event::NftMinted {
+			owner: AccountIdOrCollectionNftTuple::CollectionAndNftTuple(owner.0, owner.1),
+			collection_id,
+			nft_id,
+		});
 
 		Ok((collection_id, nft_id))
 	}
@@ -373,10 +554,11 @@ where
 		let mut sending_nft =
 			Nfts::<T>::get(collection_id, nft_id).ok_or(Error::<T>::NoAvailableNftId)?;
 
-		// TODO: Check NFT lock status
-
 		// Check NFT is transferable
 		Self::check_is_transferable(&sending_nft)?;
+
+		// NFT cannot be sent if it is equipped
+		Self::check_is_not_equipped(&sending_nft)?;
 
 		// Needs to be pending if the sending to an account or to a non-owned NFT
 		let mut approval_required = true;
@@ -460,7 +642,7 @@ where
 			Nfts::<T>::get(collection_id, nft_id).ok_or(Error::<T>::NoAvailableNftId)?;
 
 		// Prepare acceptance
-		let new_owner_account = match new_owner.clone() {
+		let new_owner_account = match new_owner {
 			AccountIdOrCollectionNftTuple::AccountId(id) => id,
 			AccountIdOrCollectionNftTuple::CollectionAndNftTuple(cid, nid) => {
 				// Check if NFT target exists
@@ -502,8 +684,16 @@ where
 		nft_id: NftId,
 		max_recursions: u32,
 	) -> Result<(T::AccountId, CollectionId, NftId), DispatchError> {
-		// Look up root owner to ensure permissions
+		// Look up root owner in Uniques to ensure permissions
 		let (root_owner, _root_nft) = Pallet::<T>::lookup_root_owner(collection_id, nft_id)?;
+
+		let nft = Nfts::<T>::get(collection_id, nft_id);
+
+		// Ensure NFT is pending (cannot reject non-pending NFT) and exists in Nfts storage
+		match nft {
+			None => return Err(Error::<T>::NoAvailableNftId.into()),
+			Some(nft) => ensure!(nft.pending, Error::<T>::CannotRejectNonPendingNft),
+		}
 
 		// Check ownership
 		ensure!(sender == root_owner, Error::<T>::CannotRejectNonOwnedNft);
@@ -542,6 +732,35 @@ impl<T: Config> Pallet<T>
 where
 	T: pallet_uniques::Config<CollectionId = CollectionId, ItemId = NftId>,
 {
+	pub fn iterate_nft_children(
+		collection_id: CollectionId,
+		nft_id: NftId,
+	) -> impl Iterator<Item = NftChild> {
+		Children::<T>::iter_key_prefix((collection_id, nft_id))
+			.into_iter()
+			.map(|(collection_id, nft_id)| NftChild { collection_id, nft_id })
+	}
+
+	pub fn iterate_resources(
+		collection_id: CollectionId,
+		nft_id: NftId,
+	) -> impl Iterator<Item = ResourceInfoOf<T>> {
+		Resources::<T>::iter_prefix_values((collection_id, nft_id))
+	}
+
+	pub fn query_properties(
+		collection_id: CollectionId,
+		nft_id: Option<NftId>,
+		filter_keys: Option<BTreeSet<BoundedVec<u8, <T as pallet_uniques::Config>::KeyLimit>>>,
+	) -> impl Iterator<Item = PropertyInfoOf<T>> {
+		Properties::<T>::iter_prefix((collection_id, nft_id))
+			.filter(move |(key, _)| match &filter_keys {
+				Some(filter_keys) => filter_keys.contains(key),
+				None => true,
+			})
+			.map(|(key, value)| PropertyInfoOf::<T> { key, value })
+	}
+
 	/// Encodes a RMRK NFT with randomness + `collection_id` + `nft_id` into a virtual account
 	/// then returning the `AccountId`. Note that we must be careful of the size of `AccountId`
 	/// as it must be wide enough to keep the size of the prefix as well as the `collection_id`
@@ -681,25 +900,6 @@ where
 		}
 	}
 
-	pub fn get_next_nft_id(collection_id: CollectionId) -> Result<NftId, Error<T>> {
-		NextNftId::<T>::try_mutate(collection_id, |id| {
-			let current_id = *id;
-			*id = id.checked_add(1).ok_or(Error::<T>::NoAvailableNftId)?;
-			Ok(current_id)
-		})
-	}
-
-	pub fn get_next_resource_id(
-		collection_id: CollectionId,
-		nft_id: NftId,
-	) -> Result<ResourceId, Error<T>> {
-		NextResourceId::<T>::try_mutate(collection_id, nft_id, |id| {
-			let current_id = *id;
-			*id = id.checked_add(1).ok_or(Error::<T>::NoAvailableResourceId)?;
-			Ok(current_id)
-		})
-	}
-
 	pub fn set_lock(nft: (CollectionId, NftId), lock_status: bool) -> bool {
 		Lock::<T>::mutate(nft, |lock| {
 			*lock = lock_status;
@@ -711,6 +911,18 @@ where
 	// Check NFT is transferable
 	pub fn check_is_transferable(nft: &InstanceInfoOf<T>) -> DispatchResult {
 		ensure!(nft.transferable, Error::<T>::NonTransferable);
+		Ok(())
+	}
+
+	/// Helper function for checking if an NFT exists
+	pub fn nft_exists(item: (CollectionId, NftId)) -> bool {
+		let (item_collection_id, item_nft_id) = item;
+		Nfts::<T>::get(item_collection_id, item_nft_id).is_some()
+	}
+
+	// Check NFT is not equipped
+	pub fn check_is_not_equipped(nft: &InstanceInfoOf<T>) -> DispatchResult {
+		ensure!(!nft.equipped, Error::<T>::CannotSendEquippedItem);
 		Ok(())
 	}
 }
